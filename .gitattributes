@@ -1,0 +1,37 @@
+# .gitattributes — https://git-scm.com/docs/gitattributes
+#
+# Paired with .editorconfig. Git normalizes any file it detects as
+# text to LF in-repo and on checkout; binary files are untouched.
+
+* text=auto eol=lf
+
+# Language-specific diff drivers for better `git diff` hunk headers.
+*.rs   diff=rust
+*.md   diff=markdown
+
+# Cargo.lock is text but generated — collapse in code-review UIs.
+Cargo.lock   linguist-generated=true
+
+# Explicit binary markers. Git auto-detects most of these, but being
+# explicit prevents accidental LF-normalization if a file starts with
+# a textlike prefix.
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.ico    binary
+*.webp   binary
+*.pdf    binary
+*.tar    binary
+*.gz     binary
+*.tgz    binary
+*.zip    binary
+*.xz     binary
+*.zst    binary
+*.exe    binary
+*.dll    binary
+*.so     binary
+*.dylib  binary
+*.a      binary
+*.o      binary
+*.rlib   binary

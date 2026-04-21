@@ -1,0 +1,29 @@
+# EditorConfig — https://editorconfig.org
+#
+# Defaults chosen to match `rustfmt`'s defaults so .editorconfig-aware
+# editors and `cargo fmt` don't fight over Rust files. Workspace-wide
+# settings are set under [*]; per-type overrides follow.
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+# Rust — matches rustfmt defaults:
+#   hard_tabs = false   → indent_style = space
+#   tab_spaces = 4      → indent_size = 4
+#   max_width = 100     → max_line_length = 100
+#   newline_style = Auto→ end_of_line = lf (inherits from [*])
+[*.rs]
+indent_size = 4
+max_line_length = 100
+
+# Markdown: preserve trailing whitespace — a line ending with two
+# spaces is a hard line break in CommonMark.
+[*.md]
+trim_trailing_whitespace = false

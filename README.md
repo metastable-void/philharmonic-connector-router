@@ -18,11 +18,10 @@ https://github.com/metastable-void/philharmonic-workspace
 - Map the authority component (`<realm>.connector.<...>`) to an
   upstream pool of `philharmonic-connector-service` instances for
   that realm.
-- Forward the request (headers + body) to a healthy upstream using a
-  simple strategy (round-robin or least-connections); stream the
-  response back to the client.
-- Surface basic dispatch-level errors (no upstreams, bad request
-  authority, upstream connect failure) as well-typed HTTP responses.
+- Forward the request (headers + body) to a realm upstream using a
+  simple round-robin strategy.
+- Surface dispatch-level errors (`400` host mismatch, `404` unknown
+  realm, `502` upstream unavailable, `500` invalid router config).
 
 ## Non-responsibilities
 
@@ -30,22 +29,40 @@ https://github.com/metastable-void/philharmonic-workspace
   (`Authorization: Bearer <COSE_Sign1 ...>`).
 - Parsing, decrypting, or inspecting encrypted payloads
   (`X-Encrypted-Payload: <COSE_Encrypt0 ...>`).
-- Rate limiting or replay protection — stateless replay suppression
-  is out of scope for v1; any rate limiting belongs in the bin that
-  wraps the library.
+- Rate limiting or replay protection.
 - Any per-tenant business logic.
 
-Both of the in-transit envelopes travel through the router as opaque
-bytes. That's by design: the router is deployed in the realm's
-front-door position but is deliberately cryptographically uninvolved,
-which keeps its trust surface minimal.
+Both in-transit envelopes travel through the router as opaque bytes.
+That is deliberate: the router is deployed in the realm's front-door
+position but is cryptographically uninvolved, which keeps its trust
+surface minimal.
+
+## Wave B surface
+
+Library API:
+
+- `DispatchConfig`: connector-domain suffix plus per-realm upstream pools.
+- `RouterState`: shared runtime state with config + `Forwarder`.
+- `router(...)`: wildcard axum router entrypoint.
+- `dispatch_request(...)`: host-based upstream dispatch handler.
+- `HyperForwarder`: default hyper-based forwarding implementation.
+
+Binary (`src/main.rs`) environment contract:
+
+- `PHILHARMONIC_ROUTER_LISTEN` (optional, default `127.0.0.1:3000`)
+- `PHILHARMONIC_ROUTER_DOMAIN` (required; for example `example.com`)
+- `PHILHARMONIC_ROUTER_REALM` (required; one realm for minimal deployment)
+- `PHILHARMONIC_ROUTER_UPSTREAMS` (required; comma-separated upstream URIs)
+
+The binary is intentionally minimal and only wires library primitives.
 
 ## Current status
 
-**Placeholder.** The routing core lands with Phase 5 Wave B
-(hybrid-KEM + COSE_Encrypt0). Until then the crate is published at
-`0.0.0` as a name reservation only. See
-[`ROADMAP.md`](../ROADMAP.md) §5 and
+Wave B dispatch skeleton is implemented and tested at crate version
+`0.0.0` pending connector-triangle Gate-2 review and coordinated
+publish/version changes at workspace level.
+
+See [`ROADMAP.md`](../ROADMAP.md) §5 and
 [`docs/design/08-connector-architecture.md`](../docs/design/08-connector-architecture.md)
 for the full triangle architecture.
 

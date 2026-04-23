@@ -9,9 +9,19 @@ this crate adheres to
 
 ## [Unreleased]
 
-Implementation pending. See the
-[Philharmonic workspace ROADMAP](https://github.com/metastable-void/philharmonic-workspace/blob/main/ROADMAP.md)
-for the phase that populates this crate.
+### Added
+
+- Added router dispatch library surface with `DispatchConfig`,
+  `DispatchConfigError`, `RouterState`, `Forwarder`, and `HyperForwarder`.
+- Added host-to-realm mapping for `<realm>.connector.<domain>` and
+  per-realm upstream round-robin selection.
+- Added wildcard axum handler that forwards requests upstream while
+  preserving `Authorization` and `X-Encrypted-Payload` pass-through headers.
+- Added minimal async binary entrypoint with environment-driven domain,
+  realm, and upstream configuration.
+- Added unit test coverage for host-based dispatch to expected upstream
+  using a mock forwarder (no real network).
+- Added crate README reflecting the Wave B dispatch implementation.
 
 ## [0.0.0]
 

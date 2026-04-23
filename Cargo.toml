@@ -9,6 +9,13 @@ repository = "https://github.com/metastable-void/philharmonic-connector-router"
 description = "Per-realm HTTP dispatcher for the Philharmonic connector layer. Terminates TLS and forwards traffic to connector service instances inside the realm."
 
 [dependencies]
+axum = "0.8"
+http-body-util = "0.1"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 opt-level = 3

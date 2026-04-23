@@ -9,6 +9,8 @@ this crate adheres to
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-04-23
+
 ### Added
 
 - Added router dispatch library surface with `DispatchConfig`,
@@ -22,7 +24,3 @@ this crate adheres to
 - Added unit test coverage for host-based dispatch to expected upstream
   using a mock forwarder (no real network).
 - Added crate README reflecting the Wave B dispatch implementation.
-
-## [0.0.0]
-
-Name reservation on crates.io. No functional content yet.

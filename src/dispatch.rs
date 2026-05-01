@@ -3,7 +3,7 @@ use std::{future::Future, pin::Pin, sync::Arc};
 use axum::{
     Router,
     body::Body,
-    extract::State,
+    extract::{Path, State},
     http::{HeaderValue, Request, Response, StatusCode, Uri, header},
     routing::any,
 };
@@ -87,17 +87,47 @@ impl RouterState {
     }
 }
 
-/// Build the axum router for dispatching all incoming requests.
+/// Build the axum router for dispatching incoming requests.
+///
+/// Two dispatch modes:
+/// - **Path-based**: `/{realm}` — the lowerer embeds the realm in the URL.
+///   No hostname assumptions needed.
+/// - **Host-based** (fallback): `Host: <realm>.connector.<domain_suffix>` —
+///   for deployments with per-realm DNS.
 pub fn router(state: RouterState) -> Router {
     Router::new()
-        .fallback(any(dispatch_request))
+        .route("/{realm}", any(dispatch_by_path))
+        .fallback(any(dispatch_by_host))
         .with_state(state)
 }
 
-/// Dispatch one incoming request by host to a realm upstream.
-pub async fn dispatch_request(
+/// Dispatch by realm extracted from URL path (`/{realm}`).
+pub async fn dispatch_by_path(
     State(state): State<RouterState>,
-    mut request: Request<Body>,
+    Path(realm): Path<String>,
+    request: Request<Body>,
+) -> Response<Body> {
+    let upstream = match state.config.select_upstream_for_realm(&realm) {
+        Ok(upstream) => upstream,
+        Err(DispatchConfigError::UnknownRealm { .. }) => {
+            return response_with_status(StatusCode::NOT_FOUND, "unknown connector realm");
+        }
+        Err(_) => {
+            return response_with_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "router configuration is invalid",
+            );
+        }
+    };
+
+    forward_to_upstream(state.forwarder.as_ref(), request, &upstream).await
+}
+
+/// Dispatch by realm extracted from `Host` header
+/// (`<realm>.connector.<domain_suffix>`).
+pub async fn dispatch_by_host(
+    State(state): State<RouterState>,
+    request: Request<Body>,
 ) -> Response<Body> {
     let host = match request
         .headers()
@@ -129,7 +159,15 @@ pub async fn dispatch_request(
         }
     };
 
-    let rewritten_uri = match rewrite_uri(request.uri(), &upstream) {
+    forward_to_upstream(state.forwarder.as_ref(), request, &upstream).await
+}
+
+async fn forward_to_upstream(
+    forwarder: &dyn Forwarder,
+    mut request: Request<Body>,
+    upstream: &Uri,
+) -> Response<Body> {
+    let rewritten_uri = match rewrite_uri(request.uri(), upstream) {
         Ok(uri) => uri,
         Err(_) => {
             return response_with_status(
@@ -146,7 +184,7 @@ pub async fn dispatch_request(
         request.headers_mut().insert(header::HOST, host_header);
     }
 
-    match state.forwarder.forward(request).await {
+    match forwarder.forward(request).await {
         Ok(response) => response,
         Err(_) => response_with_status(StatusCode::BAD_GATEWAY, "upstream unavailable"),
     }
@@ -254,6 +292,55 @@ mod tests {
         assert_eq!(
             captured.encrypted_payload,
             Some(HeaderValue::from_static("deadbeef"))
+        );
+    }
+
+    #[tokio::test]
+    async fn path_dispatches_to_expected_realm_upstream() {
+        let mut config = DispatchConfig::new("example.com").expect("config should initialize");
+        config
+            .insert_realm(
+                "prod",
+                vec![
+                    "http://connector-prod:3002"
+                        .parse()
+                        .expect("URI should parse"),
+                ],
+            )
+            .expect("realm insertion should succeed");
+
+        let mock_forwarder = MockForwarder::default();
+        let app = router(RouterState::new(config, Arc::new(mock_forwarder.clone())));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/prod")
+                    .header(header::AUTHORIZATION, "Bearer cose-token")
+                    .header("X-Encrypted-Payload", "abcdef")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{\"prompt\":\"hi\"}"))
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("router should handle request");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let captured = mock_forwarder
+            .captured
+            .lock()
+            .expect("mutex lock should succeed")
+            .clone()
+            .expect("forwarder should have captured one request");
+
+        let expected_uri: Uri = "http://connector-prod:3002/prod"
+            .parse()
+            .expect("URI should parse");
+        assert_eq!(captured.uri, expected_uri);
+        assert_eq!(
+            captured.authorization,
+            Some(HeaderValue::from_static("Bearer cose-token"))
         );
     }
 }

@@ -120,6 +120,17 @@ impl DispatchConfig {
         Ok(())
     }
 
+    /// Select one upstream URI for a realm name (round-robin).
+    pub fn select_upstream_for_realm(&self, realm: &str) -> Result<Uri, DispatchConfigError> {
+        let normalized = realm.trim().to_lowercase();
+        let pool = self.upstreams_by_realm.get(&normalized).ok_or_else(|| {
+            DispatchConfigError::UnknownRealm {
+                realm: normalized.clone(),
+            }
+        })?;
+        Ok(pool.select_round_robin())
+    }
+
     /// Resolve one request host and select one upstream URI (round-robin).
     pub fn select_upstream_for_host(&self, host: &str) -> Result<Uri, DispatchConfigError> {
         let normalized_host = normalize_host(host);

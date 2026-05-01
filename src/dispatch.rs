@@ -28,7 +28,10 @@ pub trait Forwarder: Send + Sync {
 pub enum ForwardError {
     /// Upstream request could not be completed.
     #[error("upstream request failed: {detail}")]
-    UpstreamUnavailable { detail: String },
+    UpstreamUnavailable {
+        /// Human-readable description of the upstream failure.
+        detail: String,
+    },
 }
 
 /// Hyper-based forwarder for production use.

@@ -41,23 +41,40 @@ pub enum DispatchConfigError {
 
     /// Realm name must be non-empty and must not contain dots.
     #[error("realm name '{realm}' is invalid")]
-    InvalidRealmName { realm: String },
+    InvalidRealmName {
+        /// The invalid realm name.
+        realm: String,
+    },
 
     /// At least one upstream URI is required per realm.
     #[error("realm '{realm}' has no configured upstreams")]
-    EmptyRealmUpstreams { realm: String },
+    EmptyRealmUpstreams {
+        /// The realm that has no upstreams.
+        realm: String,
+    },
 
     /// Upstream URI must include a scheme and authority.
     #[error("realm '{realm}' upstream URI '{uri}' must include scheme and authority")]
-    InvalidUpstreamUri { realm: String, uri: String },
+    InvalidUpstreamUri {
+        /// The realm containing the invalid upstream.
+        realm: String,
+        /// The invalid upstream URI string.
+        uri: String,
+    },
 
     /// Request host does not match `<realm>.connector.<domain>`.
     #[error("request host '{host}' does not match expected connector domain")]
-    HostMismatch { host: String },
+    HostMismatch {
+        /// The unrecognized host header value.
+        host: String,
+    },
 
     /// No upstreams configured for the resolved realm.
     #[error("no upstream configured for realm '{realm}'")]
-    UnknownRealm { realm: String },
+    UnknownRealm {
+        /// The realm that was not found.
+        realm: String,
+    },
 }
 
 impl DispatchConfig {

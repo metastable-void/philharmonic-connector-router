@@ -105,7 +105,7 @@ pub fn router(state: RouterState) -> Router {
 pub async fn dispatch_by_path(
     State(state): State<RouterState>,
     Path(realm): Path<String>,
-    request: Request<Body>,
+    mut request: Request<Body>,
 ) -> Response<Body> {
     let upstream = match state.config.select_upstream_for_realm(&realm) {
         Ok(upstream) => upstream,
@@ -119,6 +119,17 @@ pub async fn dispatch_by_path(
             );
         }
     };
+
+    let rewritten_uri = match strip_path_realm(request.uri(), &realm) {
+        Ok(uri) => uri,
+        Err(_) => {
+            return response_with_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to rewrite realm path",
+            );
+        }
+    };
+    *request.uri_mut() = rewritten_uri;
 
     forward_to_upstream(state.forwarder.as_ref(), request, &upstream).await
 }
@@ -221,6 +232,28 @@ fn rewrite_uri(original: &Uri, upstream: &Uri) -> Result<Uri, ()> {
     let mut parts = original.clone().into_parts();
     parts.scheme = upstream.scheme().cloned();
     parts.authority = upstream.authority().cloned();
+    Uri::from_parts(parts).map_err(|_| ())
+}
+
+fn strip_path_realm(original: &Uri, realm: &str) -> Result<Uri, ()> {
+    let path_and_query = original
+        .path_and_query()
+        .map(|value| value.as_str())
+        .ok_or(())?;
+    let prefix = format!("/{realm}");
+    let rest = path_and_query.strip_prefix(&prefix).ok_or(())?;
+    let rewritten_path_and_query = if rest.is_empty() {
+        "/".to_string()
+    } else if rest.starts_with('/') {
+        rest.to_string()
+    } else if rest.starts_with('?') {
+        format!("/{rest}")
+    } else {
+        return Err(());
+    };
+
+    let mut parts = original.clone().into_parts();
+    parts.path_and_query = Some(rewritten_path_and_query.parse().map_err(|_| ())?);
     Uri::from_parts(parts).map_err(|_| ())
 }
 
@@ -342,7 +375,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/prod")
+                    .uri("/prod?trace=true")
                     .header(header::AUTHORIZATION, "Bearer cose-token")
                     .header("X-Encrypted-Payload", "abcdef")
                     .header(header::CONTENT_TYPE, "application/json")
@@ -361,7 +394,7 @@ mod tests {
             .clone()
             .expect("forwarder should have captured one request");
 
-        let expected_uri: Uri = "http://connector-prod:3002/prod"
+        let expected_uri: Uri = "http://connector-prod:3002/?trace=true"
             .parse()
             .expect("URI should parse");
         assert_eq!(captured.uri, expected_uri);

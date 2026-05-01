@@ -162,6 +162,33 @@ pub async fn dispatch_by_host(
     forward_to_upstream(state.forwarder.as_ref(), request, &upstream).await
 }
 
+/// Dispatch a request to the upstream for the given realm.
+///
+/// This is the non-axum entry point — callers extract the realm
+/// from the URL path themselves and call this directly, bypassing
+/// axum's router/nest machinery.
+pub async fn dispatch_to_realm(
+    config: &DispatchConfig,
+    forwarder: &dyn Forwarder,
+    realm: &str,
+    request: Request<Body>,
+) -> Response<Body> {
+    let upstream = match config.select_upstream_for_realm(realm) {
+        Ok(upstream) => upstream,
+        Err(DispatchConfigError::UnknownRealm { .. }) => {
+            return response_with_status(StatusCode::NOT_FOUND, "unknown connector realm");
+        }
+        Err(_) => {
+            return response_with_status(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "router configuration is invalid",
+            );
+        }
+    };
+
+    forward_to_upstream(forwarder, request, &upstream).await
+}
+
 async fn forward_to_upstream(
     forwarder: &dyn Forwarder,
     mut request: Request<Body>,
@@ -341,6 +368,89 @@ mod tests {
         assert_eq!(
             captured.authorization,
             Some(HeaderValue::from_static("Bearer cose-token"))
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_dispatched_from_fallback_handler() {
+        let mut config = DispatchConfig::new("example.com").expect("config should initialize");
+        config
+            .insert_realm(
+                "prod",
+                vec![
+                    "http://connector-prod:3002"
+                        .parse()
+                        .expect("URI should parse"),
+                ],
+            )
+            .expect("realm insertion should succeed");
+
+        let mock_forwarder = MockForwarder::default();
+        let connector = Router::new().nest(
+            "/connector",
+            router(RouterState::new(config, Arc::new(mock_forwarder.clone()))),
+        );
+
+        let outer = Router::new().fallback(any(move |request: Request<Body>| async move {
+            connector.oneshot(request).await.unwrap()
+        }));
+
+        let response = outer
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/connector/prod")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("outer fallback should dispatch to nested connector");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "double-oneshot via fallback should reach connector handler"
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_path_dispatches_through_oneshot() {
+        let mut config = DispatchConfig::new("example.com").expect("config should initialize");
+        config
+            .insert_realm(
+                "prod",
+                vec![
+                    "http://connector-prod:3002"
+                        .parse()
+                        .expect("URI should parse"),
+                ],
+            )
+            .expect("realm insertion should succeed");
+
+        let mock_forwarder = MockForwarder::default();
+        let nested = Router::new().nest(
+            "/connector",
+            router(RouterState::new(config, Arc::new(mock_forwarder.clone()))),
+        );
+
+        let response = nested
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/connector/prod")
+                    .header(header::AUTHORIZATION, "Bearer cose-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request build should succeed"),
+            )
+            .await
+            .expect("nested router should handle request");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "nested /connector/prod should match /{{realm}} route"
         );
     }
 }

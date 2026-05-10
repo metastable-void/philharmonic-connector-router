@@ -3,7 +3,7 @@ use std::{future::Future, pin::Pin, sync::Arc};
 use axum::{
     Router,
     body::Body,
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{HeaderValue, Request, Response, StatusCode, Uri, header},
     routing::any,
 };
@@ -87,6 +87,17 @@ impl RouterState {
     }
 }
 
+/// Maximum request-body size accepted by the dispatcher.
+///
+/// Raised from axum's 2 MiB default so that workflows passing large
+/// request bodies (notably `vector_search` corpora — a 1024-dim f32
+/// CorpusItem JSON-encodes to ~10-12 KiB, putting the practical limit
+/// around 170 items at the 2 MiB default) can pass through the
+/// per-realm dispatcher to the connector service. The receiving
+/// service still enforces logical caps inside each implementation;
+/// this is just the HTTP envelope ceiling.
+pub const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+
 /// Build the axum router for dispatching incoming requests.
 ///
 /// Two dispatch modes:
@@ -98,6 +109,7 @@ pub fn router(state: RouterState) -> Router {
     Router::new()
         .route("/{realm}", any(dispatch_by_path))
         .fallback(any(dispatch_by_host))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }
 

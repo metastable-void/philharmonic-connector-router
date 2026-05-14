@@ -9,6 +9,38 @@ this crate adheres to
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-05-14
+
+### Fixed
+- `HyperForwarder` now uses `mechanics-http-client` (hyper-rustls
+  + webpki-roots + aws-lc-rs; opportunistic HTTP/3) instead of
+  hyper-util's plain `HttpConnector`. The plain connector forwarded
+  the incoming request's `Version` field through unchanged, so an
+  inbound HTTP/2 request hit a plain-HTTP connector-bin
+  (`axum::serve` on plain TCP, HTTP/1.1 only) as HTTP/2 prior
+  knowledge and produced `502 upstream unavailable`. The mhc
+  client rebuilds the outbound request internally and negotiates
+  the wire version against the connection — HTTP/1.1 on plain
+  TCP, HTTP/2 via ALPN over TLS, HTTP/3 via opportunistic QUIC
+  when discovered. The `HyperForwarder` name is preserved for
+  API compatibility; only the implementation changed.
+- `forward_to_upstream` now explicitly resets the request's
+  `Version` to `HTTP_11` before handing the request to the
+  forwarder. Belt-and-braces against any future forwarder that
+  honours the request's version field; mhc rebuilds anyway.
+- The 502 path now logs the underlying `ForwardError` detail via
+  `tracing::warn!` with `upstream` and `error` fields. The
+  previous code swallowed the error with `Err(_)` so a 502 told
+  operators nothing about whether the upstream was unreachable,
+  responding with a parse error, timing out, or returning a
+  malformed response.
+
+### Changed
+- Dropped direct `hyper` and `hyper-util` dependencies (replaced
+  by mhc's higher-level Client surface). Added `tracing`,
+  `mechanics-http-client`. `http-body-util` becomes load-bearing
+  (for `BodyExt::collect`) instead of incidental.
+
 ## [0.1.3] - 2026-05-14
 
 ### Changed

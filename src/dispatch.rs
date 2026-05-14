@@ -4,13 +4,11 @@ use axum::{
     Router,
     body::Body,
     extract::{DefaultBodyLimit, Path, State},
-    http::{HeaderValue, Request, Response, StatusCode, Uri, header},
+    http::{HeaderValue, Request, Response, StatusCode, Uri, Version, header},
     routing::any,
 };
-use hyper_util::{
-    client::legacy::{Client, connect::HttpConnector},
-    rt::TokioExecutor,
-};
+use http_body_util::BodyExt;
+use mechanics_http_client::Client as MhcClient;
 
 use crate::config::{DispatchConfig, DispatchConfigError};
 
@@ -34,17 +32,36 @@ pub enum ForwardError {
     },
 }
 
-/// Hyper-based forwarder for production use.
+/// Production forwarder for the connector router.
+///
+/// Built on `mechanics-http-client` (hyper-rustls + webpki-roots +
+/// aws-lc-rs; opportunistic HTTP/3) so the router can reach
+/// connector-bin instances regardless of whether they listen on
+/// plain HTTP or TLS. The previous incarnation wrapped hyper-util's
+/// `HttpConnector` directly — that worked for plain HTTP but
+/// forwarded the incoming request's `Version` field through to the
+/// upstream client, so an HTTP/2 inbound request hit the connector-
+/// bin with HTTP/2-prior-knowledge against an `axum::serve` listener
+/// that only handles HTTP/1.1 on plain TCP, producing `502 upstream
+/// unavailable`. `mechanics-http-client` rebuilds the outbound
+/// request internally and negotiates the version against the
+/// connection (HTTP/1.1 on plain TCP, HTTP/2 via ALPN over TLS,
+/// HTTP/3 via opportunistic QUIC when discovered).
 #[derive(Clone)]
 pub struct HyperForwarder {
-    client: Client<HttpConnector, Body>,
+    client: MhcClient,
 }
 
 impl HyperForwarder {
-    /// Construct a new hyper-based forwarder.
+    /// Construct a new forwarder. `mechanics-http-client` init can
+    /// only fail at the aws-lc-rs / rustls crypto-provider step,
+    /// which represents a build-time misconfiguration of the
+    /// process's default crypto provider rather than a runtime
+    /// condition — surface it loudly via `expect` per the narrow
+    /// init-time exception in CONTRIBUTING.md §10.3.
     pub fn new() -> Self {
-        let connector = HttpConnector::new();
-        let client = Client::builder(TokioExecutor::new()).build(connector);
+        let client = MhcClient::new()
+            .expect("mechanics-http-client init must not fail (crypto provider setup)");
         Self { client }
     }
 }
@@ -59,13 +76,64 @@ impl Forwarder for HyperForwarder {
     fn forward(&self, request: Request<Body>) -> ForwardFuture {
         let client = self.client.clone();
         Box::pin(async move {
-            client
-                .request(request)
-                .await
-                .map(|response| response.map(Body::new))
-                .map_err(|err| ForwardError::UpstreamUnavailable {
-                    detail: err.to_string(),
-                })
+            let (parts, body) = request.into_parts();
+            let body_bytes = match body.collect().await {
+                Ok(collected) => collected.to_bytes(),
+                Err(err) => {
+                    return Err(ForwardError::UpstreamUnavailable {
+                        detail: format!("failed to read request body: {err}"),
+                    });
+                }
+            };
+
+            let mut builder = client.request(parts.method.clone(), parts.uri.to_string());
+            for (name, value) in parts.headers.iter() {
+                // Hop-by-hop and client-computed headers must not be
+                // forwarded verbatim. host/content-length/transfer-
+                // encoding are recomputed by mhc against the new
+                // connection.
+                if name == header::HOST
+                    || name == header::CONTENT_LENGTH
+                    || name == header::TRANSFER_ENCODING
+                {
+                    continue;
+                }
+                builder = builder.header(name.clone(), value.clone());
+            }
+            if !body_bytes.is_empty() {
+                builder = builder.body(body_bytes);
+            }
+
+            let response = match builder.send().await {
+                Ok(r) => r,
+                Err(err) => {
+                    return Err(ForwardError::UpstreamUnavailable {
+                        detail: err.to_string(),
+                    });
+                }
+            };
+
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body_bytes = match response.bytes().await {
+                Ok(b) => b,
+                Err(err) => {
+                    return Err(ForwardError::UpstreamUnavailable {
+                        detail: format!("failed to read response body: {err}"),
+                    });
+                }
+            };
+
+            let mut hyper_response = Response::new(Body::from(body_bytes));
+            *hyper_response.status_mut() = status;
+            *hyper_response.headers_mut() = headers;
+            // Pin the response version to HTTP/1.1. We've already
+            // buffered the full body; downstream serialisation
+            // doesn't benefit from preserving the upstream's wire
+            // version, and leaving it as whatever mhc negotiated
+            // could surprise a downstream that re-forwards.
+            *hyper_response.version_mut() = Version::HTTP_11;
+            Ok(hyper_response)
         })
     }
 }
@@ -228,6 +296,15 @@ async fn forward_to_upstream(
     };
     *request.uri_mut() = rewritten_uri;
 
+    // Defensive: force HTTP/1.1 on the outbound request. Any inbound
+    // axum HTTP/2 request would otherwise propagate its `Version`
+    // field into the forwarder and (with the previous hyper-util
+    // forwarder) attempt HTTP/2 prior knowledge against an
+    // `axum::serve` listener on plain TCP. mhc rebuilds the request
+    // internally so this is belt-and-braces; remove if the trait
+    // moves to a higher-level RequestBuilder shape.
+    *request.version_mut() = Version::HTTP_11;
+
     if let Some(authority) = upstream.authority()
         && let Ok(host_header) = HeaderValue::from_str(authority.as_str())
     {
@@ -236,7 +313,14 @@ async fn forward_to_upstream(
 
     match forwarder.forward(request).await {
         Ok(response) => response,
-        Err(_) => response_with_status(StatusCode::BAD_GATEWAY, "upstream unavailable"),
+        Err(err) => {
+            tracing::warn!(
+                upstream = %upstream,
+                error = %err,
+                "connector router: upstream forward failed; returning 502"
+            );
+            response_with_status(StatusCode::BAD_GATEWAY, "upstream unavailable")
+        }
     }
 }
 

@@ -4,7 +4,7 @@ use axum::{
     Router,
     body::Body,
     extract::{DefaultBodyLimit, Path, State},
-    http::{HeaderValue, Request, Response, StatusCode, Uri, Version, header},
+    http::{HeaderName, HeaderValue, Request, Response, StatusCode, Uri, Version, header},
     routing::any,
 };
 use http_body_util::BodyExt;
@@ -88,14 +88,7 @@ impl Forwarder for HyperForwarder {
 
             let mut builder = client.request(parts.method.clone(), parts.uri.to_string());
             for (name, value) in parts.headers.iter() {
-                // Hop-by-hop and client-computed headers must not be
-                // forwarded verbatim. host/content-length/transfer-
-                // encoding are recomputed by mhc against the new
-                // connection.
-                if name == header::HOST
-                    || name == header::CONTENT_LENGTH
-                    || name == header::TRANSFER_ENCODING
-                {
+                if should_skip_forwarded_header(name) {
                     continue;
                 }
                 builder = builder.header(name.clone(), value.clone());
@@ -114,7 +107,7 @@ impl Forwarder for HyperForwarder {
             };
 
             let status = response.status();
-            let headers = response.headers().clone();
+            let upstream_headers = response.headers().clone();
             let body_bytes = match response.bytes().await {
                 Ok(b) => b,
                 Err(err) => {
@@ -126,7 +119,26 @@ impl Forwarder for HyperForwarder {
 
             let mut hyper_response = Response::new(Body::from(body_bytes));
             *hyper_response.status_mut() = status;
-            *hyper_response.headers_mut() = headers;
+            // Copy upstream response headers, but DROP every header
+            // that describes wire-level framing or body encoding —
+            // `mhc::Response.bytes()` transparently decompresses, and
+            // `Body::from(bytes)` produces a fresh content-length
+            // framing. Leaving the upstream's `Content-Length`,
+            // `Transfer-Encoding`, or `Content-Encoding` in place
+            // misdescribes the new body and trips the downstream
+            // hyper response-writer into closing the stream mid-flight
+            // (surfacing as `mhc::Error::Cancelled` for the upstream
+            // caller — exactly what the original `HyperForwarder` swap
+            // accidentally introduced). Also strip RFC 7230 §6.1
+            // hop-by-hop headers; those refer to the upstream-side
+            // connection, not the new one this response will travel.
+            let response_headers = hyper_response.headers_mut();
+            for (name, value) in upstream_headers.iter() {
+                if should_skip_response_header(name) {
+                    continue;
+                }
+                response_headers.append(name.clone(), value.clone());
+            }
             // Pin the response version to HTTP/1.1. We've already
             // buffered the full body; downstream serialisation
             // doesn't benefit from preserving the upstream's wire
@@ -322,6 +334,41 @@ async fn forward_to_upstream(
             response_with_status(StatusCode::BAD_GATEWAY, "upstream unavailable")
         }
     }
+}
+
+/// Headers that must not survive a request-forwarding hop. Covers
+/// the RFC 7230 §6.1 hop-by-hop list plus framing fields that the
+/// downstream HTTP client must recompute against its new connection.
+fn should_skip_forwarded_header(name: &HeaderName) -> bool {
+    name == header::HOST
+        || name == header::CONTENT_LENGTH
+        || name == header::TRANSFER_ENCODING
+        || name == header::CONNECTION
+        || name == header::PROXY_AUTHENTICATE
+        || name == header::PROXY_AUTHORIZATION
+        || name == header::TE
+        || name == header::TRAILER
+        || name == header::UPGRADE
+        || name.as_str().eq_ignore_ascii_case("keep-alive")
+}
+
+/// Response-side counterpart: hop-by-hop headers + every header that
+/// describes the body's wire encoding or length. `mhc::Response.bytes()`
+/// transparently decompresses and we re-frame via `Body::from(bytes)`,
+/// so the upstream `Content-Length` / `Transfer-Encoding` /
+/// `Content-Encoding` no longer describe the new body and must be
+/// recomputed (or absent and let hyper compute).
+fn should_skip_response_header(name: &HeaderName) -> bool {
+    name == header::CONTENT_LENGTH
+        || name == header::TRANSFER_ENCODING
+        || name == header::CONTENT_ENCODING
+        || name == header::CONNECTION
+        || name == header::PROXY_AUTHENTICATE
+        || name == header::PROXY_AUTHORIZATION
+        || name == header::TE
+        || name == header::TRAILER
+        || name == header::UPGRADE
+        || name.as_str().eq_ignore_ascii_case("keep-alive")
 }
 
 fn rewrite_uri(original: &Uri, upstream: &Uri) -> Result<Uri, ()> {

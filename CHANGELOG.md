@@ -9,6 +9,30 @@ this crate adheres to
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-05-14
+
+### Fixed
+- `HyperForwarder` now strips body-framing and hop-by-hop
+  headers (`Content-Length`, `Transfer-Encoding`,
+  `Content-Encoding`, `Connection`, `Keep-Alive`, `TE`,
+  `Trailer`, `Upgrade`, `Proxy-Authenticate`,
+  `Proxy-Authorization`) on **both** the request and response
+  sides instead of copying them verbatim. The 0.1.4 mhc swap
+  buffered the body via `mhc::Response.bytes()` (which
+  transparently decompresses) and re-framed it via
+  `Body::from(bytes)`, but kept the upstream's
+  `Content-Length` / `Transfer-Encoding` / `Content-Encoding`
+  in the forwarded response. The mismatch between the
+  upstream's wire framing and the new body's framing tripped
+  the downstream hyper response-writer into closing the
+  stream mid-flight — surfacing to the upstream caller
+  (typically `mechanics-core`'s endpoint client) as
+  `mhc::Error::Cancelled` and rendering in JS as a
+  `request cancelled` thrown error. RFC 7230 §6.1 hop-by-hop
+  headers are also stripped on both sides since they describe
+  the upstream-side connection, not the new one the
+  forward will travel on.
+
 ## [0.1.4] - 2026-05-14
 
 ### Fixed

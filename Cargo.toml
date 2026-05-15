@@ -10,6 +10,7 @@ description = "Per-realm HTTP dispatcher for the Philharmonic connector layer. T
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+http-body = { version = "1", default-features = false }
 http-body-util = { version = "0.1", default-features = false, features = [] }
 mechanics-http-client = { version = "0.2", default-features = false, features = ["http3"] }
 thiserror = { version = "2", default-features = false, features = ["std"] }

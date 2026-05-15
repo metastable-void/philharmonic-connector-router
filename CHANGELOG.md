@@ -9,6 +9,18 @@ this crate adheres to
 
 ## [Unreleased]
 
+### Fixed
+- `HyperForwarder` now streams the inbound request body to the
+  upstream connector-service via mhc's new `body_streaming()`
+  API instead of buffering it via `BodyExt::collect()` before
+  opening the upstream TCP connection. The buffer-first
+  approach meant a stall on inbound body completion (e.g.,
+  HTTP/3 backpressure from mechanics-worker) blocked the
+  upstream TCP dial entirely — `tcpdump -i lo 'port 3002'`
+  stayed silent even though the public router endpoint was
+  hit. Streaming opens the upstream connection immediately
+  and forwards the body as it arrives.
+
 ## [0.1.5] - 2026-05-14
 
 ### Fixed

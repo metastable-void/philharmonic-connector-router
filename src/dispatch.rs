@@ -7,7 +7,6 @@ use axum::{
     http::{HeaderName, HeaderValue, Request, Response, StatusCode, Uri, Version, header},
     routing::any,
 };
-use http_body_util::BodyExt;
 use mechanics_http_client::Client as MhcClient;
 
 use crate::config::{DispatchConfig, DispatchConfigError};
@@ -34,19 +33,9 @@ pub enum ForwardError {
 
 /// Production forwarder for the connector router.
 ///
-/// Built on `mechanics-http-client` (hyper-rustls + webpki-roots +
-/// aws-lc-rs; opportunistic HTTP/3) so the router can reach
-/// connector-bin instances regardless of whether they listen on
-/// plain HTTP or TLS. The previous incarnation wrapped hyper-util's
-/// `HttpConnector` directly — that worked for plain HTTP but
-/// forwarded the incoming request's `Version` field through to the
-/// upstream client, so an HTTP/2 inbound request hit the connector-
-/// bin with HTTP/2-prior-knowledge against an `axum::serve` listener
-/// that only handles HTTP/1.1 on plain TCP, producing `502 upstream
-/// unavailable`. `mechanics-http-client` rebuilds the outbound
-/// request internally and negotiates the version against the
-/// connection (HTTP/1.1 on plain TCP, HTTP/2 via ALPN over TLS,
-/// HTTP/3 via opportunistic QUIC when discovered).
+/// Built on `mechanics-http-client` so the router can reach connector-bin
+/// instances over HTTP/1.1, HTTP/2, or opportunistic HTTP/3 without
+/// inspecting the request body.
 #[derive(Clone)]
 pub struct HyperForwarder {
     client: MhcClient,
@@ -77,61 +66,32 @@ impl Forwarder for HyperForwarder {
         let client = self.client.clone();
         Box::pin(async move {
             let (parts, body) = request.into_parts();
-            let body_bytes = match body.collect().await {
-                Ok(collected) => collected.to_bytes(),
-                Err(err) => {
-                    return Err(ForwardError::UpstreamUnavailable {
-                        detail: format!("failed to read request body: {err}"),
-                    });
-                }
-            };
-
-            let mut builder = client.request(parts.method.clone(), parts.uri.to_string());
+            let mut builder = client.request(parts.method, parts.uri.to_string());
             for (name, value) in parts.headers.iter() {
                 if should_skip_forwarded_header(name) {
                     continue;
                 }
                 builder = builder.header(name.clone(), value.clone());
             }
-            if !body_bytes.is_empty() {
-                builder = builder.body(body_bytes);
-            }
-
-            let response = match builder.send().await {
-                Ok(r) => r,
-                Err(err) => {
-                    return Err(ForwardError::UpstreamUnavailable {
-                        detail: err.to_string(),
-                    });
+            let response = builder.body_streaming(body).send().await.map_err(|error| {
+                ForwardError::UpstreamUnavailable {
+                    detail: error.to_string(),
                 }
-            };
+            })?;
 
             let status = response.status();
             let upstream_headers = response.headers().clone();
-            let body_bytes = match response.bytes().await {
-                Ok(b) => b,
-                Err(err) => {
-                    return Err(ForwardError::UpstreamUnavailable {
-                        detail: format!("failed to read response body: {err}"),
-                    });
-                }
-            };
+            let body_bytes =
+                response
+                    .bytes()
+                    .await
+                    .map_err(|error| ForwardError::UpstreamUnavailable {
+                        detail: format!("failed to read response body: {error}"),
+                    })?;
 
             let mut hyper_response = Response::new(Body::from(body_bytes));
             *hyper_response.status_mut() = status;
-            // Copy upstream response headers, but DROP every header
-            // that describes wire-level framing or body encoding —
-            // `mhc::Response.bytes()` transparently decompresses, and
-            // `Body::from(bytes)` produces a fresh content-length
-            // framing. Leaving the upstream's `Content-Length`,
-            // `Transfer-Encoding`, or `Content-Encoding` in place
-            // misdescribes the new body and trips the downstream
-            // hyper response-writer into closing the stream mid-flight
-            // (surfacing as `mhc::Error::Cancelled` for the upstream
-            // caller — exactly what the original `HyperForwarder` swap
-            // accidentally introduced). Also strip RFC 7230 §6.1
-            // hop-by-hop headers; those refer to the upstream-side
-            // connection, not the new one this response will travel.
+            *hyper_response.version_mut() = Version::HTTP_11;
             let response_headers = hyper_response.headers_mut();
             for (name, value) in upstream_headers.iter() {
                 if should_skip_response_header(name) {
@@ -139,12 +99,6 @@ impl Forwarder for HyperForwarder {
                 }
                 response_headers.append(name.clone(), value.clone());
             }
-            // Pin the response version to HTTP/1.1. We've already
-            // buffered the full body; downstream serialisation
-            // doesn't benefit from preserving the upstream's wire
-            // version, and leaving it as whatever mhc negotiated
-            // could surprise a downstream that re-forwards.
-            *hyper_response.version_mut() = Version::HTTP_11;
             Ok(hyper_response)
         })
     }
@@ -336,9 +290,9 @@ async fn forward_to_upstream(
     }
 }
 
-/// Headers that must not survive a request-forwarding hop. Covers
-/// the RFC 7230 §6.1 hop-by-hop list plus framing fields that the
-/// downstream HTTP client must recompute against its new connection.
+/// Headers that must not survive a forwarding hop. Covers the RFC
+/// 7230 §6.1 hop-by-hop list; end-to-end representation headers
+/// stay with the streamed body.
 fn should_skip_forwarded_header(name: &HeaderName) -> bool {
     name == header::HOST
         || name == header::CONTENT_LENGTH
@@ -409,9 +363,16 @@ fn response_with_status(status: StatusCode, body: &'static str) -> Response<Body
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
+    use std::pin::Pin;
     use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+    use std::time::Duration;
 
     use super::*;
+    use axum::body::Bytes;
+    use http_body::Frame;
+    use tokio::net::TcpListener;
     use tower::util::ServiceExt;
 
     #[derive(Clone, Debug)]
@@ -443,6 +404,51 @@ mod tests {
                     .expect("response build should succeed"))
             })
         }
+    }
+
+    struct PendingAfterFirstBody {
+        sent: bool,
+    }
+
+    impl http_body::Body for PendingAfterFirstBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            if self.sent {
+                return Poll::Pending;
+            }
+            self.sent = true;
+            Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"{")))))
+        }
+    }
+
+    #[tokio::test]
+    async fn hyper_forwarder_dials_before_request_body_finishes() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test listener should have a local address");
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("http://{addr}/"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::new(PendingAfterFirstBody { sent: false }))
+            .expect("request should build");
+
+        let forwarder = HyperForwarder::new();
+        let forward_task = tokio::spawn(async move { forwarder.forward(request).await });
+
+        tokio::time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .expect("forwarder should dial before the request body reaches EOF")
+            .expect("test listener should accept one connection");
+        forward_task.abort();
     }
 
     #[tokio::test]

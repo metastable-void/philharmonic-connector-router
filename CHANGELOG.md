@@ -20,6 +20,34 @@ this crate adheres to
   stayed silent even though the public router endpoint was
   hit. Streaming opens the upstream connection immediately
   and forwards the body as it arrives.
+- `HyperForwarder` now streams the upstream response body
+  back to its caller via mhc's new `Response::into_body()`
+  raw streaming-body path instead of buffering the whole
+  upstream response via `.bytes()` before returning headers.
+  Long-running or streaming connector responses no longer
+  make the public connector-router request appear idle
+  until the mechanics 300 s timeout — response headers
+  return immediately, DATA frames pass through as they
+  arrive.
+- Response-side header filter no longer strips
+  `Content-Encoding`. With the response body now streamed
+  raw (mhc's streaming path doesn't decompress), the
+  representation must stay with the body. `Content-Length`
+  and `Transfer-Encoding` still get stripped — those are
+  framing headers owned by the forwarding hop, not the
+  representation.
+
+### Added
+- `dispatch_to_upstream(forwarder, request, upstream)`
+  forwards a request to an already-selected upstream URI.
+  Callers that need to select the upstream while holding a
+  configuration lock can now drop that lock before awaiting
+  network I/O. The api-server's dynamic connector dispatch
+  uses this to avoid holding `connector_dispatch.read()
+  .await` across the entire forwarded request, which would
+  otherwise block subsequent reads on Tokio's
+  write-preferring `RwLock` whenever a config reload was
+  waiting.
 
 ## [0.1.5] - 2026-05-14
 

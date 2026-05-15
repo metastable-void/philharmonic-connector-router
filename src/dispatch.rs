@@ -81,15 +81,13 @@ impl Forwarder for HyperForwarder {
 
             let status = response.status();
             let upstream_headers = response.headers().clone();
-            let body_bytes =
-                response
-                    .bytes()
-                    .await
-                    .map_err(|error| ForwardError::UpstreamUnavailable {
-                        detail: format!("failed to read response body: {error}"),
-                    })?;
+            let body = response
+                .into_body()
+                .map_err(|error| ForwardError::UpstreamUnavailable {
+                    detail: error.to_string(),
+                })?;
 
-            let mut hyper_response = Response::new(Body::from(body_bytes));
+            let mut hyper_response = Response::new(Body::new(body));
             *hyper_response.status_mut() = status;
             *hyper_response.version_mut() = Version::HTTP_11;
             let response_headers = hyper_response.headers_mut();
@@ -243,7 +241,20 @@ pub async fn dispatch_to_realm(
         }
     };
 
-    forward_to_upstream(forwarder, request, &upstream).await
+    dispatch_to_upstream(forwarder, request, &upstream).await
+}
+
+/// Dispatch a request to an already-selected upstream URI.
+///
+/// This is useful when callers need to select the upstream while
+/// holding a configuration lock, then drop that lock before awaiting
+/// network I/O.
+pub async fn dispatch_to_upstream(
+    forwarder: &dyn Forwarder,
+    request: Request<Body>,
+    upstream: &Uri,
+) -> Response<Body> {
+    forward_to_upstream(forwarder, request, upstream).await
 }
 
 async fn forward_to_upstream(
@@ -306,16 +317,12 @@ fn should_skip_forwarded_header(name: &HeaderName) -> bool {
         || name.as_str().eq_ignore_ascii_case("keep-alive")
 }
 
-/// Response-side counterpart: hop-by-hop headers + every header that
-/// describes the body's wire encoding or length. `mhc::Response.bytes()`
-/// transparently decompresses and we re-frame via `Body::from(bytes)`,
-/// so the upstream `Content-Length` / `Transfer-Encoding` /
-/// `Content-Encoding` no longer describe the new body and must be
-/// recomputed (or absent and let hyper compute).
+/// Response-side counterpart: hop-by-hop headers + framing headers
+/// whose values are owned by this forwarding hop. Representation
+/// headers such as `Content-Encoding` stay with the streamed body.
 fn should_skip_response_header(name: &HeaderName) -> bool {
     name == header::CONTENT_LENGTH
         || name == header::TRANSFER_ENCODING
-        || name == header::CONTENT_ENCODING
         || name == header::CONNECTION
         || name == header::PROXY_AUTHENTICATE
         || name == header::PROXY_AUTHORIZATION
@@ -372,6 +379,7 @@ mod tests {
     use super::*;
     use axum::body::Bytes;
     use http_body::Frame;
+    use http_body_util::BodyExt;
     use tokio::net::TcpListener;
     use tower::util::ServiceExt;
 
@@ -449,6 +457,76 @@ mod tests {
             .expect("forwarder should dial before the request body reaches EOF")
             .expect("test listener should accept one connection");
         forward_task.abort();
+    }
+
+    #[tokio::test]
+    async fn hyper_forwarder_returns_before_response_body_finishes() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test listener should have a local address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("test listener should accept one connection");
+            write_all(
+                &stream,
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: text/plain\r\n\r\n5\r\nhello\r\n",
+            )
+            .await;
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        let request = Request::builder()
+            .method("GET")
+            .uri(format!("http://{addr}/"))
+            .body(Body::empty())
+            .expect("request should build");
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            HyperForwarder::new().forward(request),
+        )
+        .await
+        .expect("forwarder should return after upstream response headers")
+        .expect("forwarder should accept streaming upstream response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut body = response.into_body();
+        let frame = tokio::time::timeout(Duration::from_secs(1), body.frame())
+            .await
+            .expect("first response chunk should arrive")
+            .expect("response body should have a frame")
+            .expect("response frame should succeed");
+        let data = frame.into_data().expect("frame should be data");
+        assert_eq!(data, Bytes::from_static(b"hello"));
+
+        server.abort();
+    }
+
+    async fn write_all(stream: &tokio::net::TcpStream, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            stream
+                .writable()
+                .await
+                .expect("test stream should become writable");
+            match stream.try_write(bytes) {
+                Ok(0) => panic!("test stream closed while writing response"),
+                Ok(written) => bytes = &bytes[written..],
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("test response write failed: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn response_header_filter_preserves_representation_encoding() {
+        assert!(!should_skip_response_header(&header::CONTENT_ENCODING));
+        assert!(should_skip_response_header(&header::CONTENT_LENGTH));
+        assert!(should_skip_response_header(&header::TRANSFER_ENCODING));
     }
 
     #[tokio::test]

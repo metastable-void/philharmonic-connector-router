@@ -10,6 +10,18 @@ this crate adheres to
 ## [Unreleased]
 
 ### Fixed
+- `HyperForwarder::new` now builds its mhc `Client` with
+  `pool_max_idle_per_host(0)`, disabling idle TCP connection
+  reuse for the upstream connector-service hop. The previous
+  default reuse policy means a second forwarded request can
+  pick up a stale keep-alive connection that the local
+  connector service has already closed on its side, surfacing
+  as `Error::Cancelled` on the upstream call. For local
+  connector-service hops the win from connection reuse is
+  small (loopback `connect()` is microseconds), and the
+  mechanics worker already runs with idle pooling disabled on
+  its outbound endpoint client for the same reason; applying
+  it here keeps the router's behaviour symmetric.
 - `HyperForwarder` now streams the inbound request body to the
   upstream connector-service via mhc's new `body_streaming()`
   API instead of buffering it via `BodyExt::collect()` before

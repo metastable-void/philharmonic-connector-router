@@ -49,7 +49,9 @@ impl HyperForwarder {
     /// condition — surface it loudly via `expect` per the narrow
     /// init-time exception in CONTRIBUTING.md §10.3.
     pub fn new() -> Self {
-        let client = MhcClient::new()
+        let client = MhcClient::builder()
+            .pool_max_idle_per_host(0)
+            .build()
             .expect("mechanics-http-client init must not fail (crypto provider setup)");
         Self { client }
     }
